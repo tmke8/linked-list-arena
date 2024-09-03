@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::marker::PhantomPinned;
+use std::marker::{PhantomData, PhantomPinned};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -17,6 +17,9 @@ struct InnerArena<const N: usize, T> {
     /// the end of the chunk. The reason is that MIRI then complains because of something
     /// to do with tagged pointers.
     end: NonNull<MaybeUninit<T>>,
+    /// Marker indicating that dropping the arena causes its owned
+    /// instances of `T` to be dropped.
+    _own: PhantomData<T>,
 }
 
 type Link<const N: usize, T> = Pin<Box<Chunk<N, T>>>;
@@ -31,6 +34,7 @@ impl<const N: usize, T> Arena<N, T> {
     /// Creates a new arena.
     /// This function does not allocate any memory.
     pub fn new() -> Self {
+        assert!(std::mem::size_of::<T>() != 0);
         Arena(RefCell::new(None))
     }
 
@@ -73,6 +77,7 @@ impl<const N: usize, T> Arena<N, T> {
                 head_chunk: new_chunk,
                 ptr: ptr.add(1),
                 end: ptr.add(N),
+                _own: PhantomData,
             }));
             ptr.as_mut()
         };
@@ -112,6 +117,8 @@ impl<const N: usize, T> Drop for Arena<N, T> {
 
 #[cfg(test)]
 mod test {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -174,5 +181,24 @@ mod test {
         assert_eq!(std::mem::size_of::<InnerArena<10, i32>>(), 24);
         assert_eq!(std::mem::size_of::<Arena<10, i32>>(), 32);
         assert_eq!(std::mem::size_of::<Chunk<100, i32>>(), 408);
+    }
+
+    struct CycleParticipant<'a> {
+        other: Cell<Option<&'a CycleParticipant<'a>>>,
+    }
+
+    #[test]
+    fn cycle() {
+        let arena: Arena<10, _> = Arena::new();
+
+        let a = arena.alloc(CycleParticipant {
+            other: Cell::new(None),
+        });
+        let b = arena.alloc(CycleParticipant {
+            other: Cell::new(None),
+        });
+
+        a.other.set(Some(b));
+        b.other.set(Some(a));
     }
 }
