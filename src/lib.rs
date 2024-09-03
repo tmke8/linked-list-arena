@@ -11,6 +11,11 @@ struct InnerArena<const N: usize, T> {
     chunks: Link<N, T>,
     /// A pointer to the next object to be allocated.
     ptr: NonNull<MaybeUninit<T>>,
+    /// A pointer to the end of the current chunk.
+    ///
+    /// You might wonder, why we cannot just use `chunks.slots.as_ptr().add(N)` to get
+    /// the end of the chunk. The reason is that MIRI then complains because of something
+    /// to do with tagged pointers.
     end: NonNull<MaybeUninit<T>>,
 }
 
@@ -28,45 +33,58 @@ impl<const N: usize, T> Arena<N, T> {
     }
 
     pub fn alloc(&self, elem: T) -> &mut T {
+        // Check whether anything has been allocated yet.
         if let Some(inner) = self.0.borrow_mut().as_mut() {
             let mut ptr = inner.ptr;
             let end = inner.end;
-            unsafe {
-                if ptr < end {
+            // Check whether there is still space in the current chunk.
+            if ptr < end {
+                unsafe {
                     inner.ptr = ptr.add(1);
                     return ptr.as_mut().write(elem);
                 }
             }
         }
-        // Allocate a new chunk.
+
+        // We either haven't allocated anything yet or the current chunk is full.
+        // Both mean we have to allocate a new chunk.
         let old_head = self.0.take().map(|s| s.chunks);
         let new_chunk = Box::new(Chunk {
             slots: [const { MaybeUninit::uninit() }; N],
+            // The link to the previous head is stored in the new chunk.
             next: old_head,
             _pin: PhantomPinned,
         });
 
+        // We store the link to the new chunk in the arena.
         self.0.replace(Some(InnerArena {
             chunks: Box::into_pin(new_chunk),
+            // We will initialize these pointers later.
             ptr: NonNull::dangling(),
             end: NonNull::dangling(),
         }));
+
+        // Finally, we initialize the pointers and allocate the first object.
+        // First, we get a mutable referenc to what we just wrote.
         let mut inner = self.0.borrow_mut();
         unsafe {
-            let inner = inner.as_mut().unwrap();
-            let mut ptr = NonNull::new_unchecked(
-                inner.chunks.as_mut().get_unchecked_mut().slots.as_mut_ptr(),
-            );
-            let end = ptr.add(N);
+            let inner = inner.as_mut().unwrap_unchecked();
+            // We get a mutable reference to the new chunk.
+            // Note that the chunk is pinned, so we have to be careful to not induce
+            // any moves.
+            let chunk = inner.chunks.as_mut().get_unchecked_mut();
+            // We get a pointer to the first element.
+            let mut ptr = NonNull::new_unchecked(chunk.slots.as_mut_ptr());
             inner.ptr = ptr.add(1);
-            inner.end = end;
+            inner.end = ptr.add(N);
             ptr.as_mut().write(elem)
         }
     }
     pub fn is_empty(&self) -> bool {
         self.0.borrow().is_none()
     }
-    pub fn free_slots_in_current_chunk(&self) -> usize {
+    #[cfg(test)]
+    fn free_slots_in_current_chunk(&self) -> usize {
         if let Some(inner) = self.0.borrow().as_ref() {
             return unsafe { inner.end.offset_from(inner.ptr) as usize };
         } else {
@@ -91,25 +109,29 @@ mod test {
     use super::Arena;
 
     #[test]
-    fn basics() {
+    fn empty_arena() {
         let arena = Arena::<10, i32>::new();
 
-        // Check empty list behaves right
+        // Check empty arena behaves right
         assert!(arena.is_empty());
+    }
 
+    #[test]
+    fn free_slots() {
         let arena = Arena::<10, i32>::new();
         // Populate list
         arena.alloc(1);
         assert!(!arena.is_empty());
         assert_eq!(arena.free_slots_in_current_chunk(), 9);
+    }
 
+    #[test]
+    fn deref_allocated_elements() {
         let arena = Arena::<10, i32>::new();
         let el1 = arena.alloc(2);
         let el2 = arena.alloc(3);
         assert_eq!(*el1, 2);
         assert_eq!(*el2, 3);
-        /* *el1 = 4;
-        assert_eq!(*el1, 4); */
     }
 
     #[test]
@@ -138,62 +160,4 @@ mod test {
         assert_eq!(*el2, 6);
         assert_eq!(*el3, 7);
     }
-
-    /* #[test]
-    fn peek() {
-        let mut list = List::new();
-        assert_eq!(list.peek(), None);
-        assert_eq!(list.peek_mut(), None);
-        list.push(1);
-        list.push(2);
-        list.push(3);
-
-        assert_eq!(list.peek(), Some(&3));
-        assert_eq!(list.peek_mut(), Some(&mut 3));
-
-        list.peek_mut().map(|value| *value = 42);
-
-        assert_eq!(list.peek(), Some(&42));
-        assert_eq!(list.pop(), Some(42));
-    }
-
-    #[test]
-    fn into_iter() {
-        let mut list = List::new();
-        list.push(1);
-        list.push(2);
-        list.push(3);
-
-        let mut iter = list.into_iter();
-        assert_eq!(iter.next(), Some(3));
-        assert_eq!(iter.next(), Some(2));
-        assert_eq!(iter.next(), Some(1));
-        assert_eq!(iter.next(), None);
-    }
-
-    #[test]
-    fn iter() {
-        let mut list = List::new();
-        list.push(1);
-        list.push(2);
-        list.push(3);
-
-        let mut iter = list.iter();
-        assert_eq!(iter.next(), Some(&3));
-        assert_eq!(iter.next(), Some(&2));
-        assert_eq!(iter.next(), Some(&1));
-    }
-
-    #[test]
-    fn iter_mut() {
-        let mut list = List::new();
-        list.push(1);
-        list.push(2);
-        list.push(3);
-
-        let mut iter = list.iter_mut();
-        assert_eq!(iter.next(), Some(&mut 3));
-        assert_eq!(iter.next(), Some(&mut 2));
-        assert_eq!(iter.next(), Some(&mut 1));
-    } */
 }
