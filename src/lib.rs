@@ -28,27 +28,32 @@ struct Chunk<const N: usize, T> {
 }
 
 impl<const N: usize, T> Arena<N, T> {
+    /// Creates a new arena.
+    /// This function does not allocate any memory.
     pub fn new() -> Self {
         Arena(RefCell::new(None))
     }
 
+    /// Allocates a new element in the arena and returns a mutable reference to it.
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc(&self, elem: T) -> &mut T {
         // Check whether anything has been allocated yet.
-        if let Some(inner) = self.0.borrow_mut().as_mut() {
-            let mut ptr = inner.ptr;
+        if let Some(arena) = self.0.borrow_mut().as_mut() {
+            let mut ptr = arena.ptr;
             // Check whether there is still space in the current chunk.
-            if ptr < inner.end {
-                unsafe {
-                    // Advance the pointer and write the element.
-                    inner.ptr = ptr.add(1);
-                    return ptr.as_mut().write(elem);
-                }
+            if ptr < arena.end {
+                let slot = unsafe {
+                    // Advance the pointer and turn the pointer into a mutable reference.
+                    arena.ptr = ptr.add(1);
+                    ptr.as_mut()
+                };
+                return slot.write(elem);
             }
         }
 
         // We either haven't allocated anything yet or the current chunk is full.
         // Both mean we have to allocate a new chunk.
-        let old_head = self.0.take().map(|s| s.head_chunk);
+        let old_head = self.0.take().map(|a| a.head_chunk);
         let mut new_chunk = Box::into_pin(Box::new(Chunk {
             slots: [const { MaybeUninit::uninit() }; N],
             // The link to the previous head is stored in the new chunk.
@@ -56,7 +61,7 @@ impl<const N: usize, T> Arena<N, T> {
             _pin: PhantomPinned,
         }));
 
-        unsafe {
+        let slot = unsafe {
             // Get a mutable reference to the new chunk.
             // We have to be careful here, because the chunks are pinned, so we may
             // not use the mutable reference to move the chunk in memory.
@@ -69,20 +74,28 @@ impl<const N: usize, T> Arena<N, T> {
                 ptr: ptr.add(1),
                 end: ptr.add(N),
             }));
-            ptr.as_mut().write(elem)
-        }
+            ptr.as_mut()
+        };
+        slot.write(elem)
     }
+
     pub fn is_empty(&self) -> bool {
         self.0.borrow().is_none()
     }
+
     /// Returns the number of free slots in the current chunk.
     /// If no chunk has been allocated yet, `None` is returned.
     pub fn free_slots_in_current_chunk(&self) -> Option<usize> {
-        if let Some(inner) = self.0.borrow().as_ref() {
-            return Some(unsafe { inner.end.offset_from(inner.ptr) as usize });
-        } else {
-            None
-        }
+        self.0
+            .borrow()
+            .as_ref()
+            .map(|arena| unsafe { arena.end.offset_from(arena.ptr) as usize })
+    }
+}
+
+impl<const N: usize, T> Default for Arena<N, T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -99,7 +112,7 @@ impl<const N: usize, T> Drop for Arena<N, T> {
 
 #[cfg(test)]
 mod test {
-    use super::Arena;
+    use super::*;
 
     #[test]
     fn empty_arena() {
@@ -152,5 +165,14 @@ mod test {
         assert_eq!(arena.free_slots_in_current_chunk(), Some(2));
         assert_eq!(*el2, 6);
         assert_eq!(*el3, 7);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn arena_size() {
+        assert_eq!(std::mem::size_of::<usize>(), 8);
+        assert_eq!(std::mem::size_of::<InnerArena<10, i32>>(), 24);
+        assert_eq!(std::mem::size_of::<Arena<10, i32>>(), 32);
+        assert_eq!(std::mem::size_of::<Chunk<100, i32>>(), 408);
     }
 }
