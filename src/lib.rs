@@ -49,34 +49,26 @@ impl<const N: usize, T> Arena<N, T> {
         // We either haven't allocated anything yet or the current chunk is full.
         // Both mean we have to allocate a new chunk.
         let old_head = self.0.take().map(|s| s.chunks);
-        let new_chunk = Box::new(Chunk {
+        let mut new_chunk = Box::into_pin(Box::new(Chunk {
             slots: [const { MaybeUninit::uninit() }; N],
             // The link to the previous head is stored in the new chunk.
             next: old_head,
             _pin: PhantomPinned,
-        });
-
-        // We store the link to the new chunk in the arena.
-        self.0.replace(Some(InnerArena {
-            chunks: Box::into_pin(new_chunk),
-            // We will initialize these pointers later.
-            ptr: NonNull::dangling(),
-            end: NonNull::dangling(),
         }));
 
-        // Finally, we initialize the pointers and allocate the first object.
-        // First, we get a mutable referenc to what we just wrote.
-        let mut inner = self.0.borrow_mut();
         unsafe {
-            let inner = inner.as_mut().unwrap_unchecked();
-            // We get a mutable reference to the new chunk.
-            // Note that the chunk is pinned, so we have to be careful to not induce
-            // any moves.
-            let chunk = inner.chunks.as_mut().get_unchecked_mut();
-            // We get a pointer to the first element.
-            let mut ptr = NonNull::new_unchecked(chunk.slots.as_mut_ptr());
-            inner.ptr = ptr.add(1);
-            inner.end = ptr.add(N);
+            // Get a mutable reference to the new chunk.
+            // We have to be careful here, because the chunks are pinned, so we may
+            // not use the mutable reference to move the chunk in memory.
+            let new_chunk_mut = new_chunk.as_mut().get_unchecked_mut();
+            // Get a pointer to the first slot in the new chunk.
+            let mut ptr = NonNull::new_unchecked(new_chunk_mut.slots.as_mut_ptr());
+            // We store the link to the new chunk in the arena.
+            self.0.replace(Some(InnerArena {
+                chunks: new_chunk,
+                ptr: ptr.add(1),
+                end: ptr.add(N),
+            }));
             ptr.as_mut().write(elem)
         }
     }
