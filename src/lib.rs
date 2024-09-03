@@ -7,8 +7,8 @@ use std::ptr::NonNull;
 pub struct Arena<const N: usize, T>(RefCell<Option<InnerArena<N, T>>>);
 
 struct InnerArena<const N: usize, T> {
-    /// A link to a linked list of arena chunks.
-    chunks: Link<N, T>,
+    /// A link to the first element of a linked list of arena chunks.
+    head_chunk: Link<N, T>,
     /// A pointer to the next object to be allocated.
     ptr: NonNull<MaybeUninit<T>>,
     /// A pointer to the end of the current chunk.
@@ -36,10 +36,10 @@ impl<const N: usize, T> Arena<N, T> {
         // Check whether anything has been allocated yet.
         if let Some(inner) = self.0.borrow_mut().as_mut() {
             let mut ptr = inner.ptr;
-            let end = inner.end;
             // Check whether there is still space in the current chunk.
-            if ptr < end {
+            if ptr < inner.end {
                 unsafe {
+                    // Advance the pointer and write the element.
                     inner.ptr = ptr.add(1);
                     return ptr.as_mut().write(elem);
                 }
@@ -48,7 +48,7 @@ impl<const N: usize, T> Arena<N, T> {
 
         // We either haven't allocated anything yet or the current chunk is full.
         // Both mean we have to allocate a new chunk.
-        let old_head = self.0.take().map(|s| s.chunks);
+        let old_head = self.0.take().map(|s| s.head_chunk);
         let mut new_chunk = Box::into_pin(Box::new(Chunk {
             slots: [const { MaybeUninit::uninit() }; N],
             // The link to the previous head is stored in the new chunk.
@@ -65,7 +65,7 @@ impl<const N: usize, T> Arena<N, T> {
             let mut ptr = NonNull::new_unchecked(new_chunk_mut.slots.as_mut_ptr());
             // We store the link to the new chunk in the arena.
             self.0.replace(Some(InnerArena {
-                chunks: new_chunk,
+                head_chunk: new_chunk,
                 ptr: ptr.add(1),
                 end: ptr.add(N),
             }));
@@ -75,19 +75,20 @@ impl<const N: usize, T> Arena<N, T> {
     pub fn is_empty(&self) -> bool {
         self.0.borrow().is_none()
     }
-    #[cfg(test)]
-    fn free_slots_in_current_chunk(&self) -> usize {
+    /// Returns the number of free slots in the current chunk.
+    /// If no chunk has been allocated yet, `None` is returned.
+    pub fn free_slots_in_current_chunk(&self) -> Option<usize> {
         if let Some(inner) = self.0.borrow().as_ref() {
-            return unsafe { inner.end.offset_from(inner.ptr) as usize };
+            return Some(unsafe { inner.end.offset_from(inner.ptr) as usize });
         } else {
-            N
+            None
         }
     }
 }
 
 impl<const N: usize, T> Drop for Arena<N, T> {
     fn drop(&mut self) {
-        let mut cur_link = self.0.take().map(|s| s.chunks);
+        let mut cur_link = self.0.take().map(|s| s.head_chunk);
         while let Some(boxed_node) = cur_link {
             unsafe {
                 cur_link = Pin::into_inner_unchecked(boxed_node).next.take();
@@ -114,7 +115,7 @@ mod test {
         // Populate list
         arena.alloc(1);
         assert!(!arena.is_empty());
-        assert_eq!(arena.free_slots_in_current_chunk(), 9);
+        assert_eq!(arena.free_slots_in_current_chunk(), Some(9));
     }
 
     #[test]
@@ -131,24 +132,24 @@ mod test {
         let arena = Arena::<3, i32>::new();
 
         arena.alloc(1);
-        assert_eq!(arena.free_slots_in_current_chunk(), 2);
+        assert_eq!(arena.free_slots_in_current_chunk(), Some(2));
         let el1 = arena.alloc(2);
-        assert_eq!(arena.free_slots_in_current_chunk(), 1);
+        assert_eq!(arena.free_slots_in_current_chunk(), Some(1));
         arena.alloc(3);
-        assert_eq!(arena.free_slots_in_current_chunk(), 0);
+        assert_eq!(arena.free_slots_in_current_chunk(), Some(0));
         let el2 = arena.alloc(4);
-        assert_eq!(arena.free_slots_in_current_chunk(), 2);
+        assert_eq!(arena.free_slots_in_current_chunk(), Some(2));
         arena.alloc(5);
-        assert_eq!(arena.free_slots_in_current_chunk(), 1);
+        assert_eq!(arena.free_slots_in_current_chunk(), Some(1));
         assert_eq!(*el1, 2);
         assert_eq!(*el2, 4);
         *el2 = 6;
         assert_eq!(*el1, 2);
         assert_eq!(*el2, 6);
         arena.alloc(6);
-        assert_eq!(arena.free_slots_in_current_chunk(), 0);
+        assert_eq!(arena.free_slots_in_current_chunk(), Some(0));
         let el3 = arena.alloc(7);
-        assert_eq!(arena.free_slots_in_current_chunk(), 2);
+        assert_eq!(arena.free_slots_in_current_chunk(), Some(2));
         assert_eq!(*el2, 6);
         assert_eq!(*el3, 7);
     }
