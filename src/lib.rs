@@ -1,5 +1,7 @@
 use std::cell::RefCell;
+use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
+use std::pin::Pin;
 use std::ptr::NonNull;
 
 pub struct Arena<const N: usize, T>(RefCell<Option<InnerArena<N, T>>>);
@@ -12,11 +14,12 @@ struct InnerArena<const N: usize, T> {
     end: NonNull<MaybeUninit<T>>,
 }
 
-type Link<const N: usize, T> = Box<Chunk<N, T>>;
+type Link<const N: usize, T> = Pin<Box<Chunk<N, T>>>;
 
 struct Chunk<const N: usize, T> {
     slots: [MaybeUninit<T>; N],
     next: Option<Link<N, T>>,
+    _pin: PhantomPinned,
 }
 
 impl<const N: usize, T> Arena<N, T> {
@@ -36,31 +39,27 @@ impl<const N: usize, T> Arena<N, T> {
             }
         }
         // Allocate a new chunk.
-        unsafe {
-            let inner = self.0.take();
-            let old_head = match inner {
-                Some(mut inner) => {
-                    inner.ptr = NonNull::dangling();
-                    inner.end = NonNull::dangling();
-                    Some(inner.chunks)
-                }
-                None => None,
-            };
-            let new_chunk = Box::new(Chunk {
-                slots: [const { MaybeUninit::uninit() }; N],
-                next: old_head,
-            });
+        let old_head = self.0.take().map(|s| s.chunks);
+        let new_chunk = Box::new(Chunk {
+            slots: [const { MaybeUninit::uninit() }; N],
+            next: old_head,
+            _pin: PhantomPinned,
+        });
 
-            self.0.replace(Some(InnerArena {
-                chunks: new_chunk,
-                ptr: NonNull::dangling(),
-                end: NonNull::dangling(),
-            }));
-            let mut inner = self.0.borrow_mut();
-            let mut ptr = NonNull::new_unchecked(inner.as_mut().unwrap().chunks.slots.as_mut_ptr());
+        self.0.replace(Some(InnerArena {
+            chunks: Box::into_pin(new_chunk),
+            ptr: NonNull::dangling(),
+            end: NonNull::dangling(),
+        }));
+        let mut inner = self.0.borrow_mut();
+        unsafe {
+            let inner = inner.as_mut().unwrap();
+            let mut ptr = NonNull::new_unchecked(
+                inner.chunks.as_mut().get_unchecked_mut().slots.as_mut_ptr(),
+            );
             let end = ptr.add(N);
-            inner.as_mut().unwrap().ptr = ptr.add(1);
-            inner.as_mut().unwrap().end = end;
+            inner.ptr = ptr.add(1);
+            inner.end = end;
             ptr.as_mut().write(elem)
         }
     }
@@ -79,8 +78,10 @@ impl<const N: usize, T> Arena<N, T> {
 impl<const N: usize, T> Drop for Arena<N, T> {
     fn drop(&mut self) {
         let mut cur_link = self.0.take().map(|s| s.chunks);
-        while let Some(mut boxed_node) = cur_link {
-            cur_link = boxed_node.next.take();
+        while let Some(boxed_node) = cur_link {
+            unsafe {
+                cur_link = Pin::into_inner_unchecked(boxed_node).next.take();
+            }
         }
     }
 }
@@ -130,6 +131,12 @@ mod test {
         *el2 = 6;
         assert_eq!(*el1, 2);
         assert_eq!(*el2, 6);
+        arena.alloc(6);
+        assert_eq!(arena.free_slots_in_current_chunk(), 0);
+        let el3 = arena.alloc(7);
+        assert_eq!(arena.free_slots_in_current_chunk(), 2);
+        assert_eq!(*el2, 6);
+        assert_eq!(*el3, 7);
     }
 
     /* #[test]
