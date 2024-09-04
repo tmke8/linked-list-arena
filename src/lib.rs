@@ -1,10 +1,12 @@
 use std::cell::RefCell;
-use std::marker::{PhantomData, PhantomPinned};
+use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr::NonNull;
 
-pub struct Arena<const N: usize, T>(RefCell<Option<InnerArena<N, T>>>);
+pub struct Arena<const N: usize, T> {
+    inner: RefCell<Option<InnerArena<N, T>>>,
+}
 
 struct InnerArena<const N: usize, T> {
     /// A link to the first element of a linked list of arena chunks.
@@ -17,9 +19,6 @@ struct InnerArena<const N: usize, T> {
     /// the end of the chunk. The reason is that MIRI then complains because of something
     /// to do with tagged pointers.
     end: NonNull<MaybeUninit<T>>,
-    /// Marker indicating that dropping the arena causes its owned
-    /// instances of `T` to be dropped.
-    _own: PhantomData<T>,
 }
 
 type Link<const N: usize, T> = Pin<Box<Chunk<N, T>>>;
@@ -35,14 +34,16 @@ impl<const N: usize, T> Arena<N, T> {
     /// This function does not allocate any memory.
     pub fn new() -> Self {
         assert!(std::mem::size_of::<T>() != 0);
-        Arena(RefCell::new(None))
+        Arena {
+            inner: RefCell::new(None),
+        }
     }
 
     /// Allocates a new element in the arena and returns a mutable reference to it.
     #[allow(clippy::mut_from_ref)]
     pub fn alloc(&self, elem: T) -> &mut T {
         // Check whether anything has been allocated yet.
-        if let Some(arena) = self.0.borrow_mut().as_mut() {
+        if let Some(arena) = self.inner.borrow_mut().as_mut() {
             let mut ptr = arena.ptr;
             // Check whether there is still space in the current chunk.
             if ptr < arena.end {
@@ -57,7 +58,7 @@ impl<const N: usize, T> Arena<N, T> {
 
         // We either haven't allocated anything yet or the current chunk is full.
         // Both mean we have to allocate a new chunk.
-        let old_head = self.0.take().map(|a| a.head_chunk);
+        let old_head = self.inner.take().map(|a| a.head_chunk);
         let mut new_chunk = Box::into_pin(Box::new(Chunk {
             slots: [const { MaybeUninit::uninit() }; N],
             // The link to the previous head is stored in the new chunk.
@@ -73,11 +74,10 @@ impl<const N: usize, T> Arena<N, T> {
             // Get a pointer to the first slot in the new chunk.
             let mut ptr = NonNull::new_unchecked(new_chunk_mut.slots.as_mut_ptr());
             // We store the link to the new chunk in the arena.
-            self.0.replace(Some(InnerArena {
+            self.inner.replace(Some(InnerArena {
                 head_chunk: new_chunk,
                 ptr: ptr.add(1),
                 end: ptr.add(N),
-                _own: PhantomData,
             }));
             ptr.as_mut()
         };
@@ -85,16 +85,50 @@ impl<const N: usize, T> Arena<N, T> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.borrow().is_none()
+        self.inner.borrow().is_none()
     }
 
     /// Returns the number of free slots in the current chunk.
     /// If no chunk has been allocated yet, `None` is returned.
     pub fn free_slots_in_current_chunk(&self) -> Option<usize> {
-        self.0
+        self.inner
             .borrow()
             .as_ref()
             .map(|arena| unsafe { arena.end.offset_from(arena.ptr) as usize })
+    }
+
+    /// Consumes the arena and destroys it.
+    ///
+    /// This is potentially more efficient than relying on the default Drop implementation,
+    /// but it has the disadvantage that it cannot be used if there are internal references
+    /// between the elements in the arena.
+    ///
+    /// This also calls the destructor of all elements in the arena.
+    pub fn destroy(self) {
+        if let Some(arena) = self.inner.into_inner() {
+            unsafe {
+                let mut head_chunk = Pin::into_inner_unchecked(arena.head_chunk);
+                // Iterate over the elements in `head_chunk.slots` until `arena.ptr`
+                // and call `assume_init_drop()` on each of them, because we know that they
+                // have been initialized.
+                let mut ptr = NonNull::new_unchecked(head_chunk.slots.as_mut_ptr());
+                while ptr < arena.ptr {
+                    ptr.as_mut().assume_init_drop();
+                    ptr = ptr.add(1);
+                }
+
+                // Iterate over the linked list of chunks and drop all elements.
+                let mut cur_link = head_chunk.next.take();
+                while let Some(boxed_node) = cur_link {
+                    let mut chunk = Pin::into_inner_unchecked(boxed_node);
+                    // In the chunks that are not the head chunk, all elements have been initialized.
+                    chunk.slots.iter_mut().for_each(|slot| {
+                        slot.assume_init_drop();
+                    });
+                    cur_link = chunk.next.take();
+                }
+            }
+        }
     }
 }
 
@@ -104,35 +138,23 @@ impl<const N: usize, T> Default for Arena<N, T> {
     }
 }
 
-impl<const N: usize, T> Drop for Arena<N, T> {
-    fn drop(&mut self) {
-        let mut cur_link = self.0.take().map(|s| s.head_chunk);
-        while let Some(boxed_node) = cur_link {
-            unsafe {
-                cur_link = Pin::into_inner_unchecked(boxed_node).next.take();
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use super::*;
 
     #[test]
     fn empty_arena() {
         let arena = Arena::<10, i32>::new();
-
-        // Check empty arena behaves right
         assert!(arena.is_empty());
     }
 
     #[test]
     fn free_slots() {
         let arena = Arena::<10, i32>::new();
-        // Populate list
         arena.alloc(1);
         assert!(!arena.is_empty());
         assert_eq!(arena.free_slots_in_current_chunk(), Some(9));
@@ -172,14 +194,15 @@ mod test {
         assert_eq!(arena.free_slots_in_current_chunk(), Some(2));
         assert_eq!(*el2, 6);
         assert_eq!(*el3, 7);
+        arena.destroy();
     }
 
     #[cfg(target_pointer_width = "64")]
     #[test]
-    fn arena_size() {
+    fn data_structure_size() {
         assert_eq!(std::mem::size_of::<usize>(), 8);
-        assert_eq!(std::mem::size_of::<InnerArena<10, i32>>(), 24);
-        assert_eq!(std::mem::size_of::<Arena<10, i32>>(), 32);
+        assert_eq!(std::mem::size_of::<InnerArena<1, i32>>(), 24);
+        assert_eq!(std::mem::size_of::<Arena<1, i32>>(), 32);
         assert_eq!(std::mem::size_of::<Chunk<100, i32>>(), 408);
     }
 
@@ -200,5 +223,31 @@ mod test {
 
         a.other.set(Some(b));
         b.other.set(Some(a));
+    }
+
+    struct WithDrop(i32, Arc<AtomicUsize>);
+
+    impl Drop for WithDrop {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn drop_arena() {
+        let drop_counter = Arc::new(AtomicUsize::new(0));
+
+        let arena = Arena::<3, WithDrop>::new();
+        let el1 = arena.alloc(WithDrop(1, Arc::clone(&drop_counter)));
+        arena.alloc(WithDrop(2, Arc::clone(&drop_counter)));
+        arena.alloc(WithDrop(3, Arc::clone(&drop_counter)));
+        arena.alloc(WithDrop(4, Arc::clone(&drop_counter)));
+        arena.alloc(WithDrop(5, Arc::clone(&drop_counter)));
+        arena.alloc(WithDrop(6, Arc::clone(&drop_counter)));
+        arena.alloc(WithDrop(7, Arc::clone(&drop_counter)));
+        assert_eq!(el1.0, 1);
+        arena.destroy(); // Should be calling drop on all elements.
+
+        assert_eq!(drop_counter.load(Ordering::SeqCst), 7);
     }
 }
