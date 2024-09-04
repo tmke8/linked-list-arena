@@ -4,6 +4,8 @@ use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr::NonNull;
 
+pub mod double;
+
 pub struct Arena<const N: usize, T> {
     inner: RefCell<Option<InnerArena<N, T>>>,
 }
